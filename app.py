@@ -1,6 +1,9 @@
+from datetime import datetime, timezone
+from threading import Lock
+
 import streamlit as st
 
-from analyzer import analyze
+from analyzer import analyze, get_config
 
 
 st.set_page_config(
@@ -8,6 +11,37 @@ st.set_page_config(
     page_icon="🛡️",
     layout="wide",
 )
+
+
+@st.cache_resource
+def get_daily_usage():
+    return {
+        "date": datetime.now(timezone.utc).date().isoformat(),
+        "count": 0,
+    }
+
+
+@st.cache_resource
+def get_daily_usage_lock():
+    return Lock()
+
+
+access_code = get_config("APP_ACCESS_CODE")
+if access_code:
+    if "access_granted" not in st.session_state:
+        st.session_state.access_granted = False
+    if not st.session_state.access_granted:
+        entered_code = st.text_input("অ্যাক্সেস কোড দিন", type="password")
+        if st.button("প্রবেশ করুন"):
+            if entered_code == str(access_code):
+                st.session_state.access_granted = True
+                st.rerun()
+            else:
+                st.warning("অ্যাক্সেস কোডটি সঠিক নয়। আবার চেষ্টা করুন।")
+        st.stop()
+
+if "analysis_count" not in st.session_state:
+    st.session_state.analysis_count = 0
 
 
 def fill_message(text):
@@ -83,15 +117,40 @@ if analyze_clicked:
     if not message.strip() and uploaded is None:
         st.session_state.result = None
         st.warning("একটি মেসেজ লিখুন অথবা স্ক্রিনশট আপলোড করুন।")
+    elif st.session_state.analysis_count >= 15:
+        st.warning("এই সেশনে সর্বোচ্চ ১৫টি বিশ্লেষণ করা যাবে। পরে আবার চেষ্টা করুন।")
     else:
-        with st.spinner("মেসেজটি বিশ্লেষণ করা হচ্ছে..."):
-            image_bytes = uploaded.getvalue() if uploaded is not None else None
-            image_mime = uploaded.type if uploaded is not None else "image/png"
-            st.session_state.result = analyze(
-                text=message if message.strip() else None,
-                image_bytes=image_bytes,
-                image_mime_type=image_mime,
-            )
+        try:
+            max_daily_requests = int(get_config("MAX_DAILY_REQUESTS", 150))
+        except (TypeError, ValueError):
+            st.error("দৈনিক সীমার কনফিগারেশন সঠিক নয়।")
+            st.stop()
+
+        image_bytes = uploaded.getvalue() if uploaded is not None else None
+        image_mime = uploaded.type if uploaded is not None else "image/png"
+        usage = get_daily_usage()
+        with get_daily_usage_lock():
+            today = datetime.now(timezone.utc).date().isoformat()
+            if usage["date"] != today:
+                usage["date"] = today
+                usage["count"] = 0
+
+            if usage["count"] >= max_daily_requests:
+                daily_cap_reached = True
+            else:
+                daily_cap_reached = False
+                usage["count"] += 1
+                st.session_state.analysis_count += 1
+
+        if daily_cap_reached:
+            st.warning("আজকের পরীক্ষার সীমা শেষ, কাল আবার চেষ্টা করুন।")
+        else:
+            with st.spinner("মেসেজটি বিশ্লেষণ করা হচ্ছে..."):
+                st.session_state.result = analyze(
+                    text=message if message.strip() else None,
+                    image_bytes=image_bytes,
+                    image_mime_type=image_mime,
+                )
 
 with right:
     st.subheader("ফলাফল")
@@ -185,9 +244,13 @@ with right:
                 "এই মুহূর্তে সার্ভারে চাপ আছে, একটু পরে আবার চেষ্টা করুন।"
             )
             with st.expander("টেকনিক্যাল তথ্য"):
-                st.write(f"Raw error: {result.get('error', '')}")
+                raw_error = str(result.get("error", ""))
+                api_key = get_config("GEMINI_API_KEY")
+                if api_key:
+                    raw_error = raw_error.replace(str(api_key), "[REDACTED]")
+                st.write(f"ত্রুটির বিবরণ: {raw_error}")
                 if "model_used" in result:
-                    st.write(f"Model used: {result['model_used']}")
+                    st.write(f"ব্যবহৃত মডেল: {result['model_used']}")
 
 st.caption(
     "এটি একটি AI সহায়ক টুল, চূড়ান্ত সিদ্ধান্ত নয়। "

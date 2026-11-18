@@ -1,6 +1,8 @@
 import argparse
+import json
 import sys
 import time
+from pathlib import Path
 
 import pandas as pd
 
@@ -8,6 +10,19 @@ from analyzer import analyze
 
 
 sys.stdout.reconfigure(encoding="utf-8")
+
+CACHE_PATH = Path("eval_cache.json")
+RESULT_COLUMNS = [
+    "message",
+    "correct_verdict",
+    "correct_type",
+    "predicted_verdict",
+    "predicted_type",
+    "confidence",
+    "reason",
+    "model_used",
+    "status",
+]
 
 
 def percent(correct, total):
@@ -19,7 +34,26 @@ def percent(correct, total):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--fresh", action="store_true")
     args = parser.parse_args()
+
+    if args.fresh:
+        CACHE_PATH.unlink(missing_ok=True)
+        cache = {}
+    elif CACHE_PATH.exists():
+        with CACHE_PATH.open("r", encoding="utf-8") as cache_file:
+            cache = json.load(cache_file)
+        if not isinstance(cache, dict):
+            raise ValueError("eval_cache.json must contain a JSON object.")
+        cache = {
+            message: result
+            for message, result in cache.items()
+            if isinstance(message, str)
+            and isinstance(result, dict)
+            and "error" not in result
+        }
+    else:
+        cache = {}
 
     data = pd.read_csv("test_data.csv", encoding="utf-8-sig")
     if args.limit is not None:
@@ -28,18 +62,33 @@ def main():
     results = []
     api_error_count = 0
     total = len(data)
+    consecutive_errors = 0
+    last_was_api_call = False
 
-    for index, row in data.iterrows():
+    for position, (_, row) in enumerate(data.iterrows(), start=1):
         message = str(row["message"])
-        result = analyze(text=message)
-
-        print(f"[{index + 1}/{total}]")
+        cached = message in cache
+        print(f"[{position}/{total}]" + (" cached" if cached else ""))
+        if cached:
+            result = cache[message]
+            consecutive_errors = 0
+        else:
+            if last_was_api_call:
+                time.sleep(4)
+            result = analyze(text=message)
+            last_was_api_call = True
 
         if "error" in result:
             api_error_count += 1
+            consecutive_errors += 1
             status = "api_error"
         else:
+            consecutive_errors = 0
             status = "evaluated"
+            if not cached:
+                cache[message] = result
+                with CACHE_PATH.open("w", encoding="utf-8") as cache_file:
+                    json.dump(cache, cache_file, ensure_ascii=False, indent=2)
 
         predicted_verdict = result.get("verdict", "suspicious")
         predicted_type = result.get("scam_type", "none")
@@ -59,10 +108,19 @@ def main():
             "status": status,
         })
 
-        if index + 1 < total:
-            time.sleep(4)
+        if consecutive_errors >= 3:
+            completed = len(results)
+            print(
+                "তিনটি সারিতে পরপর API ত্রুটি হয়েছে। "
+                f"এখন পর্যন্ত {completed}টি সারি সম্পন্ন হয়েছে।"
+            )
+            print(
+                "Stopping early after 3 consecutive API errors. "
+                f"{completed} rows completed so far."
+            )
+            break
 
-    results_df = pd.DataFrame(results)
+    results_df = pd.DataFrame(results, columns=RESULT_COLUMNS)
     results_df.to_csv("results.csv", index=False, encoding="utf-8-sig")
 
     evaluated = results_df[results_df["status"] == "evaluated"].copy()
@@ -107,7 +165,7 @@ def main():
     ).sum()
     scam_type_accuracy = percent(type_matches, len(type_scope))
 
-    print("Total rows evaluated:", total)
+    print("Total rows evaluated:", len(results_df))
     print("api_errors:", api_error_count)
     print(f"Exact verdict accuracy: {exact_verdict_accuracy:.1f}%")
     print(f"Binary safety accuracy: {binary_safety_accuracy:.1f}%")
