@@ -1,3 +1,7 @@
+import hmac
+import json
+import math
+import time
 from datetime import datetime, timezone
 from threading import Lock
 
@@ -26,19 +30,88 @@ def get_daily_usage_lock():
     return Lock()
 
 
-access_code = get_config("APP_ACCESS_CODE")
-if access_code:
-    if "access_granted" not in st.session_state:
-        st.session_state.access_granted = False
-    if not st.session_state.access_granted:
-        entered_code = st.text_input("অ্যাক্সেস কোড দিন", type="password")
-        if st.button("প্রবেশ করুন"):
-            if entered_code == str(access_code):
-                st.session_state.access_granted = True
+try:
+    auth_users_config = get_config("AUTH_USERS")
+    if not isinstance(auth_users_config, str):
+        raise ValueError
+    configured_auth_users = json.loads(auth_users_config)
+    if not isinstance(configured_auth_users, dict) or not configured_auth_users:
+        raise ValueError
+
+    auth_users = {}
+    for configured_username, configured_password in configured_auth_users.items():
+        if not isinstance(configured_username, str) or not isinstance(
+            configured_password, str
+        ):
+            raise ValueError
+        normalized_username = configured_username.strip().lower()
+        if (
+            not normalized_username
+            or not configured_password
+            or normalized_username in auth_users
+        ):
+            raise ValueError
+        auth_users[normalized_username] = configured_password
+except (TypeError, ValueError):
+    st.error("লগইন কনফিগার করা হয়নি")
+    st.stop()
+
+if st.session_state.get("auth_user") not in auth_users:
+    st.session_state.pop("auth_user", None)
+    st.session_state.setdefault("auth_failed_attempts", 0)
+
+    lock_until = st.session_state.get("auth_lock_until", 0)
+    remaining_seconds = max(0, math.ceil(lock_until - time.time()))
+    if remaining_seconds == 0:
+        st.session_state["auth_failed_attempts"] = 0
+        st.session_state.pop("auth_lock_until", None)
+
+    left, center, right = st.columns([1, 1.5, 1])
+    with center:
+        st.title("🛡️ স্ক্যাম ডিটেক্টর")
+        st.write("সন্দেহজনক বার্তা নিরাপদে যাচাই করুন।")
+        if remaining_seconds:
+            st.warning(
+                f"অনেকবার ভুল চেষ্টা হয়েছে। {remaining_seconds} "
+                "সেকেন্ড পরে আবার চেষ্টা করুন।"
+            )
+
+        with st.form("login_form"):
+            entered_username = st.text_input("ইউজারনেম বা ইমেইল")
+            entered_password = st.text_input("পাসওয়ার্ড", type="password")
+            login_clicked = st.form_submit_button(
+                "লগইন",
+                use_container_width=True,
+                disabled=bool(remaining_seconds),
+            )
+
+        if login_clicked:
+            normalized_username = entered_username.strip().lower()
+            username_known = normalized_username in auth_users
+            expected_password = auth_users.get(
+                normalized_username,
+                "__invalid_auth_user__",
+            )
+            password_matches = hmac.compare_digest(
+                entered_password.encode("utf-8"),
+                expected_password.encode("utf-8"),
+            )
+            if username_known and password_matches:
+                st.session_state["auth_user"] = normalized_username
+                st.session_state["auth_failed_attempts"] = 0
+                st.session_state.pop("auth_lock_until", None)
                 st.rerun()
             else:
-                st.warning("অ্যাক্সেস কোডটি সঠিক নয়। আবার চেষ্টা করুন।")
-        st.stop()
+                st.session_state["auth_failed_attempts"] += 1
+                st.error("ইউজারনেম বা পাসওয়ার্ড ভুল")
+                if st.session_state["auth_failed_attempts"] >= 5:
+                    st.session_state["auth_lock_until"] = time.time() + 60
+                    st.warning(
+                        "অনেকবার ভুল চেষ্টা হয়েছে। "
+                        f"{math.ceil(st.session_state['auth_lock_until'] - time.time())} "
+                        "সেকেন্ড পরে আবার চেষ্টা করুন।"
+                    )
+    st.stop()
 
 if "analysis_count" not in st.session_state:
     st.session_state.analysis_count = 0
@@ -55,6 +128,14 @@ st.write(
 )
 
 with st.sidebar:
+    st.write(f"লগইন করেছেন: {st.session_state['auth_user']}")
+    if st.button("লগআউট"):
+        st.session_state.pop("auth_user", None)
+        st.session_state.pop("auth_failed_attempts", None)
+        st.session_state.pop("auth_lock_until", None)
+        st.session_state.pop("result", None)
+        st.rerun()
+
     st.header("নমুনা মেসেজ")
 
     st.button(
@@ -117,8 +198,8 @@ if analyze_clicked:
     if not message.strip() and uploaded is None:
         st.session_state.result = None
         st.warning("একটি মেসেজ লিখুন অথবা স্ক্রিনশট আপলোড করুন।")
-    elif st.session_state.analysis_count >= 15:
-        st.warning("এই সেশনে সর্বোচ্চ ১৫টি বিশ্লেষণ করা যাবে। পরে আবার চেষ্টা করুন।")
+    elif st.session_state.analysis_count >= 30:
+        st.warning("এই সেশনে সর্বোচ্চ ৩০টি বিশ্লেষণ করা যাবে। পরে আবার চেষ্টা করুন।")
     else:
         try:
             max_daily_requests = int(get_config("MAX_DAILY_REQUESTS", 150))
